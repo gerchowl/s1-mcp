@@ -789,10 +789,10 @@ mod tests {
     #[test]
     fn base64_matches_rfc4648() {
         assert_eq!(b64encode(b""), "");
-        assert_eq!(b64encode(b"f"), "Zg==");
-        assert_eq!(b64encode(b"fo"), "Zm8=");
-        assert_eq!(b64encode(b"foo"), "Zm9v");
-        assert_eq!(b64encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(b64encode(b"M"), "TQ==");
+        assert_eq!(b64encode(b"Ma"), "TWE=");
+        assert_eq!(b64encode(b"Man"), "TWFu");
+        assert_eq!(b64encode(b"Many hands"), "TWFueSBoYW5kcw==");
     }
 
     #[test]
