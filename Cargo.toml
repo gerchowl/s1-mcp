@@ -3,11 +3,14 @@ name = "s1-mcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "MCP server for System One decision models"
+description = "MCP server for System One decision models (Clef, Kev, Jev, any /v1/systemone endpoint): typed yes/no, choice and score questions with calibrated probabilities"
 license = "Apache-2.0"
 repository = "https://github.com/gerchowl/s1-mcp"
 readme = "README.md"
 
+# Deliberately the same crates (and lockfile versions) as gerchowl/watcher-s1:
+# they are already in the fleet's binary cache, and any crate nix has to fetch
+# from crates.io itself can 403 the build (crates.io blocks curl's User-Agent).
 [dependencies]
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
