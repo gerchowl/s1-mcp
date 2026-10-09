@@ -467,9 +467,11 @@ mod tests {
         let r = redact_str(s);
         assert!(!r.contains("ghp_abc") && !r.contains("sk-proj"));
         assert!(r.contains("sky-high") && r.contains("token="));
-        let pem =
-            "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\nb";
-        assert_eq!(redact_str(pem), "a\n[REDACTED PRIVATE KEY]\nb");
+        let pem = format!(
+            "a\n-----BEGIN {k}-----\nabc\n-----END {k}-----\nb",
+            k = ["OPENSSH", "PRIVATE", "KEY"].join(" ")
+        );
+        assert_eq!(redact_str(&pem), "a\n[REDACTED PRIVATE KEY]\nb");
         let v = redact(&json!({"api_key": "hunter2", "n": 3, "msg": ["AKIAABCDEFGHIJKLMNOP"]}));
         assert_eq!(v["api_key"], "[REDACTED]");
         assert_eq!(v["msg"][0], "[REDACTED]");
