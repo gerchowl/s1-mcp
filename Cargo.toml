@@ -1,0 +1,20 @@
+[package]
+name = "s1-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "MCP server for System One decision models"
+license = "Apache-2.0"
+repository = "https://github.com/gerchowl/s1-mcp"
+readme = "README.md"
+
+[dependencies]
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+webpki-roots = "1.0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
