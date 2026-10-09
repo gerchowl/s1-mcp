@@ -55,6 +55,8 @@ The registry is re-read on every request, so an overlay edit applies without res
 
 `$S1_MCP_LOG_DIR` or `~/.local/state/s1-mcp/calls.jsonl`: directory 0700, file 0600, never sent anywhere. Each call records the state (with a light redaction of credential-shaped strings), the questions, every model's answers and latency, and context (host, harness, repo basename, session id). Images are recorded by origin and size, never their bytes. Ratings are separate records that point at a `call_id`. `S1_MCP_LOG=off` disables logging.
 
+Rotation: once `calls.jsonl` would pass `$S1_MCP_LOG_ROTATE_MB` (default 50), it is renamed to `calls-<UTC timestamp>.jsonl` and a new file is started. Rotated segments whose last write is older than `$S1_MCP_LOG_RETENTION_DAYS` (default 90, `0` = keep forever) are deleted. Every agent session runs its own s1-mcp process, and they all append to the same file, so size check, rename and append happen under one inter-process file lock (`.calls.lock`). The rotating-log crates keep an in-process counter, which is safe for threads but lets two processes rotate at once. `s1_report` reads every segment in its `since_days` window, and `s1_rate` searches newest first.
+
 ## CLI
 
 ```
