@@ -1,0 +1,7 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>gerchowl/s1-mcp//.github/renovate-default"
+  ],
+  "enabledManagers": ["github-actions", "pep621", "npm", "cargo"]
+}
