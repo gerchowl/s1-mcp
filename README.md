@@ -9,6 +9,7 @@ Infrastructure scaffold; the Rust implementation will arrive through a PR to `de
 Enter the pinned Rust 1.95.0 environment with `nix develop` or `direnv allow`.
 Run `nix flake check` for formatting, clippy, tests, and documentation checks.
 Build the binary with `nix build .#default`.
+Changes enter through PRs to `dev`; CI validates the scaffold and Rust package.
 
 ## License
 
