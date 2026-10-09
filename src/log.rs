@@ -6,12 +6,21 @@
 //! (that is what makes a call replayable against the next model) after a light
 //! redaction of things that look like credentials; images are logged by size
 //! and origin only, never their bytes.
+//!
+//! Rotation: past `$S1_MCP_LOG_ROTATE_MB` (default 50) the file is renamed to
+//! `calls-<UTC timestamp>.jsonl` and a fresh one started; rotated segments
+//! whose last write is older than `$S1_MCP_LOG_RETENTION_DAYS` (default 90,
+//! `0` keeps them forever) are deleted. Every agent session runs its own
+//! s1-mcp process and they all append to the same file, so the size check,
+//! the rename and the append happen under one inter-process lock
+//! (`.calls.lock`): an in-process counter, which is what the rotating-log
+//! crates keep, would let two sessions rotate at once.
 
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn dir() -> PathBuf {
     if let Some(d) = std::env::var_os("S1_MCP_LOG_DIR") {
@@ -32,31 +41,139 @@ pub fn disabled() -> bool {
     std::env::var("S1_MCP_LOG").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    pub rotate_bytes: u64,
+    /// `None` keeps rotated segments forever.
+    pub retention: Option<Duration>,
+}
+
+impl Policy {
+    pub fn from_env() -> Policy {
+        let num = |k: &str, d: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(d)
+        };
+        let mb = num("S1_MCP_LOG_ROTATE_MB", 50.0).max(1.0);
+        let days = num("S1_MCP_LOG_RETENTION_DAYS", 90.0);
+        Policy {
+            rotate_bytes: (mb * 1024.0 * 1024.0) as u64,
+            retention: (days > 0.0).then(|| Duration::from_secs_f64(days * 86_400.0)),
+        }
+    }
+}
+
 pub fn append(rec: &Value) -> Result<(), String> {
     if disabled() {
         return Ok(());
     }
-    let d = dir();
-    std::fs::create_dir_all(&d).map_err(|e| format!("log dir {}: {e}", d.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700));
-    }
+    append_in(&dir(), rec, Policy::from_env())
+}
+
+fn open_private(p: &Path, append: bool) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
+    opts.create(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.write(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(path())
-        .map_err(|e| format!("log {}: {e}", path().display()))?;
+    opts.open(p)
+}
+
+pub fn append_in(d: &Path, rec: &Value, policy: Policy) -> Result<(), String> {
+    std::fs::create_dir_all(d).map_err(|e| format!("log dir {}: {e}", d.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+    }
     let mut line = serde_json::to_vec(rec).map_err(|e| e.to_string())?;
     line.push(b'\n');
-    // One write per record: O_APPEND keeps concurrent servers' lines whole.
+
+    // Held until the end of this function (dropping the file releases it).
+    let lock = open_private(&d.join(".calls.lock"), false)
+        .map_err(|e| format!("log lock {}: {e}", d.display()))?;
+    lock.lock().map_err(|e| format!("log lock: {e}"))?;
+
+    let current = d.join("calls.jsonl");
+    let size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+    let rotated = size > 0 && size + line.len() as u64 > policy.rotate_bytes;
+    if rotated {
+        let stamp: String = iso(now_ms())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let mut target = d.join(format!("calls-{stamp}.jsonl"));
+        let mut n = 1;
+        while target.exists() {
+            target = d.join(format!("calls-{stamp}-{n}.jsonl"));
+            n += 1;
+        }
+        std::fs::rename(&current, &target).map_err(|e| format!("log rotate: {e}"))?;
+    }
+    // Prune on every rotation and once per process, so a host that never
+    // reaches the size limit still drops expired segments.
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    PRUNED.call_once(|| first = true);
+    if (rotated || first)
+        && let Some(keep) = policy.retention
+    {
+        prune(d, keep);
+    }
+
+    let mut f =
+        open_private(&current, true).map_err(|e| format!("log {}: {e}", current.display()))?;
+    // One write per record: O_APPEND keeps concurrent servers' lines whole
+    // even for a reader that takes no lock.
     f.write_all(&line).map_err(|e| format!("log write: {e}"))
+}
+
+/// Rotated segments, oldest first (the UTC stamp in the name sorts).
+fn rotated_segments(d: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("calls-") && n.ends_with(".jsonl"))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn prune(d: &Path, keep: Duration) {
+    let now = SystemTime::now();
+    for p in rotated_segments(d) {
+        let old = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > keep);
+        if old {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+/// Every segment, oldest first; the live file last.
+fn segments(d: &Path) -> Vec<PathBuf> {
+    let mut v = rotated_segments(d);
+    v.push(d.join("calls.jsonl"));
+    v
 }
 
 pub fn now_ms() -> u128 {
@@ -268,8 +385,8 @@ fn redact_str(s: &str) -> String {
     res
 }
 
-pub fn read_all() -> Vec<Value> {
-    let Ok(f) = std::fs::File::open(path()) else {
+fn read_file(p: &Path) -> Vec<Value> {
+    let Ok(f) = std::fs::File::open(p) else {
         return vec![];
     };
     std::io::BufReader::new(f)
@@ -279,10 +396,29 @@ pub fn read_all() -> Vec<Value> {
         .collect()
 }
 
+/// Records from every segment last written at or after `since_ms` (all when None).
+fn read_since(since_ms: Option<u128>) -> Vec<Value> {
+    segments(&dir())
+        .iter()
+        .filter(|p| {
+            let Some(cut) = since_ms else { return true };
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .is_none_or(|t| t.as_millis() >= cut)
+        })
+        .flat_map(|p| read_file(p))
+        .collect()
+}
+
+/// Newest segment first: a call is usually rated soon after it was made.
 pub fn find_call(id: &str) -> Option<Value> {
-    read_all().into_iter().find(|r| {
-        r.get("kind").and_then(Value::as_str) == Some("call")
-            && r.get("call_id").and_then(Value::as_str) == Some(id)
+    segments(&dir()).iter().rev().find_map(|p| {
+        read_file(p).into_iter().find(|r| {
+            r.get("kind").and_then(Value::as_str) == Some("call")
+                && r.get("call_id").and_then(Value::as_str) == Some(id)
+        })
     })
 }
 
@@ -304,8 +440,8 @@ struct Agg {
 
 /// Aggregate the log by use case × model. `since_days` and filters narrow it.
 pub fn report(use_case: Option<&str>, model: Option<&str>, since_days: Option<f64>) -> Value {
-    let recs = read_all();
     let cutoff = since_days.map(|d| now_ms().saturating_sub((d * 86_400_000.0) as u128));
+    let recs = read_since(cutoff);
     let mut ratings: BTreeMap<String, Value> = BTreeMap::new();
     for r in &recs {
         if r.get("kind").and_then(Value::as_str) == Some("rating")
@@ -476,6 +612,101 @@ mod tests {
         assert_eq!(v["api_key"], "[REDACTED]");
         assert_eq!(v["msg"][0], "[REDACTED]");
         assert_eq!(v["n"], 3);
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("s1-mcp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn lines(d: &Path) -> usize {
+        segments(d).iter().map(|p| read_file(p).len()).sum()
+    }
+
+    #[test]
+    fn rotates_past_the_limit_without_losing_records() {
+        let d = tmp("rotate");
+        let policy = Policy {
+            rotate_bytes: 200,
+            retention: None,
+        };
+        for i in 0..10 {
+            append_in(
+                &d,
+                &json!({"kind": "call", "i": i, "pad": "x".repeat(60)}),
+                policy,
+            )
+            .unwrap();
+        }
+        assert!(rotated_segments(&d).len() >= 3, "expected several segments");
+        assert_eq!(lines(&d), 10);
+        // Each segment stays within the limit (no single record exceeds it).
+        for p in segments(&d) {
+            assert!(std::fs::metadata(&p).unwrap().len() <= 200);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_rotate_safely() {
+        // Threads stand in for the many s1-mcp processes of a busy host: the
+        // lock is a file lock, so it serialises threads the same way.
+        let d = tmp("concurrent");
+        let policy = Policy {
+            rotate_bytes: 1_000,
+            retention: None,
+        };
+        std::thread::scope(|sc| {
+            for t in 0..8 {
+                let d = &d;
+                sc.spawn(move || {
+                    for i in 0..50 {
+                        append_in(
+                            d,
+                            &json!({"kind": "call", "t": t, "i": i, "pad": "y".repeat(40)}),
+                            policy,
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(lines(&d), 400, "every record survives rotation");
+        let mut seen = std::collections::HashSet::new();
+        for r in segments(&d).iter().flat_map(|p| read_file(p)) {
+            assert!(
+                seen.insert((r["t"].as_u64(), r["i"].as_u64())),
+                "duplicate {r}"
+            );
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prunes_only_expired_rotated_segments() {
+        let d = tmp("prune");
+        std::fs::create_dir_all(&d).unwrap();
+        let old = d.join("calls-20250101T000000Z.jsonl");
+        let fresh = d.join("calls-20261001T000000Z.jsonl");
+        for p in [&old, &fresh] {
+            std::fs::write(p, "{}\n").unwrap();
+        }
+        let f = std::fs::File::options().write(true).open(&old).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(100 * 86_400))
+            .unwrap();
+        std::fs::write(d.join("calls.jsonl"), "{}\n").unwrap();
+        prune(&d, Duration::from_secs(90 * 86_400));
+        assert!(!old.exists());
+        assert!(fresh.exists() && d.join("calls.jsonl").exists());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn policy_reads_env_defaults() {
+        let p = Policy::from_env();
+        assert_eq!(p.rotate_bytes, 50 * 1024 * 1024);
+        assert_eq!(p.retention, Some(Duration::from_secs(90 * 86_400)));
     }
 
     #[test]
